@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Neural Geofence Tracker</title>
+    
+    <!-- Leaflet CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        #map { width: 100%; height: 100vh; z-index: 1; }
+        
+        /* Floating UI Overlay */
+        #ui-layer {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            width: 90%; max-width: 400px; background: rgba(255, 255, 255, 0.95);
+            padding: 20px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            z-index: 1000; text-align: center; backdrop-filter: blur(10px);
+        }
+        
+        #status-box { font-size: 28px; font-weight: 800; margin: 15px 0; color: #7f8c8d; transition: color 0.3s; }
+        #coords-box { font-size: 12px; color: #95a5a6; margin-bottom: 15px; }
+        
+        .btn {
+            background: #2980b9; color: white; border: none; padding: 12px 20px;
+            border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%;
+        }
+        input[type="file"] { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="ui-layer">
+        <h3 style="margin-top:0; color: #2c3e50;">Neural Tracker</h3>
+        <label for="modelInput" class="btn" id="uploadBtn">📂 Load geofence_model.json</label>
+        <input type="file" id="modelInput" accept=".json" />
+        
+        <div id="status-box">WAITING FOR MODEL</div>
+        <div id="coords-box">GPS: Searching...</div>
+    </div>
+
+    <script>
+        // --- 1. Map Initialization ---
+        var map = L.map('map', {zoomControl: false}).setView([0, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+        
+        var userMarker = null;
+        var boundaryLayer = null;
+        var activeModel = null;
+
+        // --- 2. Load the JSON Model ---
+        document.getElementById('modelInput').addEventListener('change', function(e) {
+            var file = e.target.files[0];
+            if (!file) return;
+            
+            var reader = new FileReader();
+            reader.onload = function(evt) {
+                try {
+                    activeModel = JSON.parse(evt.target.result);
+                    document.getElementById('uploadBtn').innerText = "✅ Model Loaded: " + activeModel.arch;
+                    document.getElementById('status-box').innerText = "SEARCHING GPS...";
+                    
+                    // Draw the AI Boundary
+                    if (boundaryLayer) map.removeLayer(boundaryLayer);
+                    if (activeModel.boundary && activeModel.boundary.length > 0) {
+                        boundaryLayer = L.polygon(activeModel.boundary, {
+                            color: '#3498db', weight: 3, fillColor: '#3498db', fillOpacity: 0.2, dashArray: '5, 5'
+                        }).addTo(map);
+                        map.fitBounds(boundaryLayer.getBounds(), {padding: [50, 50]});
+                    } else {
+                        map.setView([activeModel.anchor_lat, activeModel.anchor_lon], 18);
+                    }
+                } catch(err) {
+                    alert("Invalid JSON Model file!");
+                }
+            };
+            reader.readAsText(file);
+        });
+
+        // --- 3. JavaScript Neural Engine ---
+        function relu(x) { return Math.max(0, x); }
+        function sigmoid(x) { return 1.0 / (1.0 + Math.exp(-x)); }
+
+        // Mimics PyTorch nn.Linear
+        function dense_layer(input_vec, weight_matrix, bias_vec, apply_relu) {
+            let out = new Array(bias_vec.length).fill(0);
+            for(let i = 0; i < bias_vec.length; i++) {
+                let sum = bias_vec[i]; // Start with bias
+                for(let j = 0; j < input_vec.length; j++) {
+                    sum += input_vec[j] * weight_matrix[i][j]; // Add w * x
+                }
+                out[i] = apply_relu ? relu(sum) : sum;
+            }
+            return out;
+        }
+
+        function neural_inference(x_norm, y_norm) {
+            if (!activeModel) return 0.0;
+            let w = activeModel.weights;
+            let arch = activeModel.arch;
+            let out = [x_norm, y_norm]; // Initial 2D input
+            
+            if (arch === "Small") {
+                out = dense_layer(out, w["model.0.weight"], w["model.0.bias"], true);
+                out = dense_layer(out, w["model.2.weight"], w["model.2.bias"], false);
+            } else if (arch === "Medium") {
+                out = dense_layer(out, w["model.0.weight"], w["model.0.bias"], true);
+                out = dense_layer(out, w["model.2.weight"], w["model.2.bias"], true);
+                out = dense_layer(out, w["model.4.weight"], w["model.4.bias"], false);
+            } else if (arch === "Deep") {
+                out = dense_layer(out, w["model.0.weight"], w["model.0.bias"], true);
+                out = dense_layer(out, w["model.2.weight"], w["model.2.bias"], true);
+                out = dense_layer(out, w["model.4.weight"], w["model.4.bias"], true);
+                out = dense_layer(out, w["model.6.weight"], w["model.6.bias"], false);
+            }
+            
+            return sigmoid(out[0]);
+        }
+
+        // --- 4. Live GPS Processing ---
+        const DEG2RAD = Math.PI / 180.0;
+        const EARTH_DEG_METERS = 111320.0;
+
+        function check_geofence(lon, lat) {
+            if (!activeModel) return;
+            
+            // Project GPS to Local Meters
+            let lat_rad = activeModel.anchor_lat * DEG2RAD;
+            let x_m = (lon - activeModel.anchor_lon) * EARTH_DEG_METERS * Math.cos(lat_rad);
+            let y_m = (lat - activeModel.anchor_lat) * EARTH_DEG_METERS;
+            
+            // Normalize
+            let norm_x = x_m / activeModel.scale_factor;
+            let norm_y = y_m / activeModel.scale_factor;
+            
+            // Run Neural AI
+            let prob = neural_inference(norm_x, norm_y);
+            let isInside = prob >= 0.5;
+            
+            // Update UI
+            let statusBox = document.getElementById('status-box');
+            if (isInside) {
+                statusBox.innerText = "INSIDE (" + (prob*100).toFixed(1) + "%)";
+                statusBox.style.color = "#2ecc71"; // Green
+                if(userMarker) userMarker.setStyle({fillColor: '#2ecc71'});
+            } else {
+                statusBox.innerText = "OUTSIDE (" + (prob*100).toFixed(1) + "%)";
+                statusBox.style.color = "#e74c3c"; // Red
+                if(userMarker) userMarker.setStyle({fillColor: '#e74c3c'});
+            }
+        }
+
+        // --- 5. GPS Hardware Hook ---
+        if ("geolocation" in navigator) {
+            navigator.geolocation.watchPosition((position) => {
+                let lat = position.coords.latitude;
+                let lon = position.coords.longitude;
+                
+                document.getElementById('coords-box').innerText = "GPS: " + lon.toFixed(5) + ", " + lat.toFixed(5);
+                
+                // Update Marker on Map
+                if (!userMarker) {
+                    userMarker = L.circleMarker([lat, lon], {
+                        radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1
+                    }).addTo(map);
+                    map.setView([lat, lon], 16);
+                } else {
+                    userMarker.setLatLng([lat, lon]);
+                }
+                
+                check_geofence(lon, lat);
+                
+            }, (error) => {
+                document.getElementById('coords-box').innerText = "GPS Error: Please enable location permissions.";
+            }, { enableHighAccuracy: true });
+        } else {
+            document.getElementById('coords-box').innerText = "Geolocation not supported by this browser.";
+        }
+    </script>
+</body>
+</html>

@@ -45,6 +45,9 @@
 
     <div id="ui-layer">
         <h3 style="margin-top:0; color: #2c3e50;">Neural Tracker</h3>
+        
+        <button id="wakeBtn" class="btn" style="background: #e67e22; margin-bottom: 10px;">🌙 Keep Screen Awake</button>
+        
         <label for="modelInput" class="btn" id="uploadBtn">📂 Load geofence_model.json</label>
         <input type="file" id="modelInput" accept=".json" />
         
@@ -60,6 +63,35 @@
         if (!deviceId || deviceId.trim() === "") {
             deviceId = "Anonymous_Device";
         }
+		
+        // --- 0. Wake Lock API (Prevents phone from sleeping) ---
+        let wakeLock = null;
+        const wakeBtn = document.getElementById('wakeBtn');
+        
+        wakeBtn.addEventListener('click', async () => {
+            if ('wakeLock' in navigator) {
+                try {
+                    if (!wakeLock) {
+                        wakeLock = await navigator.wakeLock.request('screen');
+                        wakeBtn.innerText = "☀️ Screen Awake (Active)";
+                        wakeBtn.style.background = "#2ecc71"; // Green
+                        
+                        // If the user minimizes the app, the OS releases the lock. We catch it here.
+                        wakeLock.addEventListener('release', () => {
+                            wakeLock = null;
+                            wakeBtn.innerText = "🌙 Keep Screen Awake";
+                            wakeBtn.style.background = "#e67e22"; // Orange
+                        });
+                    } else {
+                        await wakeLock.release();
+                    }
+                } catch (err) {
+                    alert("Wake Lock error: " + err.message);
+                }
+            } else {
+                alert("Wake Lock is not supported on this browser.");
+            }
+        });
 
         // --- 1. Map & MQTT Initialization ---
         var map = L.map('map', {zoomControl: false}).setView([0, 0], 2);
@@ -191,40 +223,52 @@
         const EARTH_DEG_METERS = 111320.0;
 
         function check_geofence(lon, lat) {
-            if (!activeModel) return;
-            
-            let lat_rad = activeModel.anchor_lat * DEG2RAD;
-            let x_m = (lon - activeModel.anchor_lon) * EARTH_DEG_METERS * Math.cos(lat_rad);
-            let y_m = (lat - activeModel.anchor_lat) * EARTH_DEG_METERS;
-            
-            let norm_x = x_m / activeModel.scale_factor;
-            let norm_y = y_m / activeModel.scale_factor;
-            
-            let result = neural_inference(norm_x, norm_y);
-            
             let statusBox = document.getElementById('status-box');
-            let colors = {0: '#95a5a6', 1: '#2ecc71', 2: '#f1c40f', 3: '#e74c3c'};
-            let zoneName = "Outside";
-            
-            if (result.class === 0) {
-                statusBox.innerText = "OUTSIDE (" + (result.prob*100).toFixed(1) + "%)";
-                statusBox.style.color = colors[0];
-                if(userMarker) userMarker.setStyle({fillColor: colors[0]});
+            let zoneName = "Not Assigned";
+            let prob = 0.0;
+            let color = '#95a5a6'; // Default Grey
+
+            // Only run the Neural Network if the JSON file is loaded!
+            if (activeModel) {
+                let lat_rad = activeModel.anchor_lat * DEG2RAD;
+                let x_m = (lon - activeModel.anchor_lon) * EARTH_DEG_METERS * Math.cos(lat_rad);
+                let y_m = (lat - activeModel.anchor_lat) * EARTH_DEG_METERS;
+                
+                let norm_x = x_m / activeModel.scale_factor;
+                let norm_y = y_m / activeModel.scale_factor;
+                
+                let result = neural_inference(norm_x, norm_y);
+                prob = result.prob;
+                
+                let colors = {0: '#95a5a6', 1: '#2ecc71', 2: '#f1c40f', 3: '#e74c3c'};
+                
+                if (result.class === 0) {
+                    zoneName = "Outside";
+                    statusBox.innerText = "OUTSIDE (" + (prob*100).toFixed(1) + "%)";
+                    statusBox.style.color = colors[0];
+                    color = colors[0];
+                } else {
+                    zoneName = activeModel.labels[result.class] || "Priority " + result.class;
+                    statusBox.innerText = zoneName + " (" + (prob*100).toFixed(1) + "%)";
+                    statusBox.style.color = colors[result.class];
+                    color = colors[result.class];
+                }
             } else {
-                zoneName = activeModel.labels[result.class] || "Priority " + result.class;
-                statusBox.innerText = zoneName + " (" + (result.prob*100).toFixed(1) + "%)";
-                statusBox.style.color = colors[result.class];
-                if(userMarker) userMarker.setStyle({fillColor: colors[result.class]});
+                statusBox.innerText = "WAITING FOR MODEL";
+                statusBox.style.color = color;
             }
 
-            // Stream payload back to Python Sandbox over WebSockets Cloud Relay
+            // Color the map marker
+            if(userMarker) userMarker.setStyle({fillColor: color});
+
+            // ALWAYS Stream payload back to Python Sandbox, even if Not Assigned!
             if (client.connected) {
                 let payload = {
                     device_id: deviceId,
                     lon: lon,
                     lat: lat,
                     zone: zoneName,
-                    prob: parseFloat(result.prob.toFixed(3))
+                    prob: parseFloat(prob.toFixed(3))
                 };
                 client.publish(telemetryTopic, JSON.stringify(payload));
             }

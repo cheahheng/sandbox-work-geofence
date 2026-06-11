@@ -50,6 +50,7 @@
         
         <div id="status-box">WAITING FOR MODEL</div>
         <div id="coords-box">GPS: Searching...</div>
+        <div id="mqtt-box" style="font-size: 11px; color: #e67e22; font-weight: bold; margin-top: 5px;">Relay: Disconnected</div>
     </div>
 
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
@@ -68,14 +69,32 @@
         var boundaryLayers = [];
         var activeModel = null;
 
-        // Secure MQTT over WebSockets (Using HiveMQ public broker)
+        // Secure MQTT over WebSockets (Using HiveMQ secure public endpoint)
         // Fully compliant with GitHub HTTPS hosting constraints
-        const brokerUrl = 'wss://broker.hivemq.com:8000/mqtt'; 
+        // Port 8884 is the standard SSL/TLS WebSockets port for HiveMQ
+        const brokerUrl = 'wss://broker.hivemq.com:8884/mqtt'; 
         const telemetryTopic = 'neural_sandbox/telemetry/stream';
-        const client = mqtt.connect(brokerUrl, { clientId: 'client_' + deviceId + '_' + Math.random().toString(16).substr(2, 8) });
+        const client = mqtt.connect(brokerUrl, { 
+            clientId: 'client_' + deviceId + '_' + Math.random().toString(16).substr(2, 8),
+            clean: true,
+            connectTimeout: 4000
+        });
 
         client.on('connect', () => {
             console.log('Connected to Cloud IoT Relay Engine');
+            document.getElementById('mqtt-box').innerText = "📡 Relay: Online as " + deviceId;
+            document.getElementById('mqtt-box').style.color = "#2ecc71"; // Green
+        });
+
+        client.on('error', (err) => {
+            console.error('MQTT Connection Error: ', err);
+            document.getElementById('mqtt-box').innerText = "⚠️ Relay Error: Check Port/SSL";
+            document.getElementById('mqtt-box').style.color = "#e74c3c"; // Red
+        });
+
+        client.on('offline', () => {
+            document.getElementById('mqtt-box').innerText = "💤 Relay: Offline";
+            document.getElementById('mqtt-box').style.color = "#7f8c8d"; // Grey
         });
 
         // --- 2. Load the JSON Model ---

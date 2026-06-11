@@ -28,6 +28,14 @@
             background: #2980b9; color: white; border: none; padding: 12px 20px;
             border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%;
         }
+		
+        .ai-zone-label {
+            background: rgba(255, 255, 255, 0.8);
+            border: none;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            font-weight: bold;
+            color: #2c3e50;
+        }
         input[type="file"] { display: none; }
     </style>
 </head>
@@ -44,14 +52,31 @@
         <div id="coords-box">GPS: Searching...</div>
     </div>
 
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <script>
-        // --- 1. Map Initialization ---
+        // Prompt for Device ID immediately on launch
+        var deviceId = prompt("Please enter a unique Device ID / User Name:", "Device_" + Math.floor(Math.random() * 1000));
+        if (!deviceId || deviceId.trim() === "") {
+            deviceId = "Anonymous_Device";
+        }
+
+        // --- 1. Map & MQTT Initialization ---
         var map = L.map('map', {zoomControl: false}).setView([0, 0], 2);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
         
         var userMarker = null;
-        var boundaryLayer = null;
+        var boundaryLayers = [];
         var activeModel = null;
+
+        // Secure MQTT over WebSockets (Using HiveMQ public broker)
+        // Fully compliant with GitHub HTTPS hosting constraints
+        const brokerUrl = 'wss://broker.hivemq.com:8000/mqtt'; 
+        const telemetryTopic = 'neural_sandbox/telemetry/stream';
+        const client = mqtt.connect(brokerUrl, { clientId: 'client_' + deviceId + '_' + Math.random().toString(16).substr(2, 8) });
+
+        client.on('connect', () => {
+            console.log('Connected to Cloud IoT Relay Engine');
+        });
 
         // --- 2. Load the JSON Model ---
         document.getElementById('modelInput').addEventListener('change', function(e) {
@@ -65,13 +90,26 @@
                     document.getElementById('uploadBtn').innerText = "✅ Model Loaded: " + activeModel.arch;
                     document.getElementById('status-box').innerText = "SEARCHING GPS...";
                     
-                    // Draw the AI Boundary
-                    if (boundaryLayer) map.removeLayer(boundaryLayer);
+                    if (window.boundaryLayers) {
+                        window.boundaryLayers.forEach(layer => map.removeLayer(layer));
+                    }
+                    window.boundaryLayers = [];
+
                     if (activeModel.boundary && activeModel.boundary.length > 0) {
-                        boundaryLayer = L.polygon(activeModel.boundary, {
-                            color: '#3498db', weight: 3, fillColor: '#3498db', fillOpacity: 0.2, dashArray: '5, 5'
-                        }).addTo(map);
-                        map.fitBounds(boundaryLayer.getBounds(), {padding: [50, 50]});
+                        let allBounds = [];
+                        activeModel.boundary.forEach(group => {
+                            let zoneName = activeModel.labels[group.class_idx] || "Priority " + group.class_idx;
+                            let layer = L.polygon(group.polys, {
+                                color: group.color, weight: 3, fillColor: group.color, fillOpacity: 0.2, dashArray: '5, 5'
+                            }).bindTooltip(zoneName, {
+                                permanent: true, direction: "center", className: "ai-zone-label"
+                            }).addTo(map);
+                            window.boundaryLayers.push(layer);
+                            allBounds.push(layer.getBounds());
+                        });
+                        if (allBounds.length > 0) {
+                            map.fitBounds(allBounds[0], {padding: [50, 50]});
+                        }
                     } else {
                         map.setView([activeModel.anchor_lat, activeModel.anchor_lon], 18);
                     }
@@ -82,17 +120,15 @@
             reader.readAsText(file);
         });
 
-        // --- 3. JavaScript Neural Engine ---
         function relu(x) { return Math.max(0, x); }
         function sigmoid(x) { return 1.0 / (1.0 + Math.exp(-x)); }
 
-        // Mimics PyTorch nn.Linear
         function dense_layer(input_vec, weight_matrix, bias_vec, apply_relu) {
             let out = new Array(bias_vec.length).fill(0);
             for(let i = 0; i < bias_vec.length; i++) {
-                let sum = bias_vec[i]; // Start with bias
+                let sum = bias_vec[i];
                 for(let j = 0; j < input_vec.length; j++) {
-                    sum += input_vec[j] * weight_matrix[i][j]; // Add w * x
+                    sum += input_vec[j] * weight_matrix[i][j];
                 }
                 out[i] = apply_relu ? relu(sum) : sum;
             }
@@ -100,10 +136,10 @@
         }
 
         function neural_inference(x_norm, y_norm) {
-            if (!activeModel) return 0.0;
+            if (!activeModel) return {class: 0, prob: 0};
             let w = activeModel.weights;
             let arch = activeModel.arch;
-            let out = [x_norm, y_norm]; // Initial 2D input
+            let out = [x_norm, y_norm]; 
             
             if (arch === "Small") {
                 out = dense_layer(out, w["model.0.weight"], w["model.0.bias"], true);
@@ -119,7 +155,16 @@
                 out = dense_layer(out, w["model.6.weight"], w["model.6.bias"], false);
             }
             
-            return sigmoid(out[0]);
+            let max_val = Math.max(...out);
+            let sum_exp = 0.0;
+            let exp_out = out.map(v => { let e = Math.exp(v - max_val); sum_exp += e; return e; });
+            
+            let best_class = 0; let best_prob = 0;
+            for(let i=0; i<4; i++) {
+                let prob = exp_out[i] / sum_exp;
+                if(prob > best_prob) { best_prob = prob; best_class = i; }
+            }
+            return {class: best_class, prob: best_prob};
         }
 
         // --- 4. Live GPS Processing ---
@@ -129,29 +174,40 @@
         function check_geofence(lon, lat) {
             if (!activeModel) return;
             
-            // Project GPS to Local Meters
             let lat_rad = activeModel.anchor_lat * DEG2RAD;
             let x_m = (lon - activeModel.anchor_lon) * EARTH_DEG_METERS * Math.cos(lat_rad);
             let y_m = (lat - activeModel.anchor_lat) * EARTH_DEG_METERS;
             
-            // Normalize
             let norm_x = x_m / activeModel.scale_factor;
             let norm_y = y_m / activeModel.scale_factor;
             
-            // Run Neural AI
-            let prob = neural_inference(norm_x, norm_y);
-            let isInside = prob >= 0.5;
+            let result = neural_inference(norm_x, norm_y);
             
-            // Update UI
             let statusBox = document.getElementById('status-box');
-            if (isInside) {
-                statusBox.innerText = "INSIDE (" + (prob*100).toFixed(1) + "%)";
-                statusBox.style.color = "#2ecc71"; // Green
-                if(userMarker) userMarker.setStyle({fillColor: '#2ecc71'});
+            let colors = {0: '#95a5a6', 1: '#2ecc71', 2: '#f1c40f', 3: '#e74c3c'};
+            let zoneName = "Outside";
+            
+            if (result.class === 0) {
+                statusBox.innerText = "OUTSIDE (" + (result.prob*100).toFixed(1) + "%)";
+                statusBox.style.color = colors[0];
+                if(userMarker) userMarker.setStyle({fillColor: colors[0]});
             } else {
-                statusBox.innerText = "OUTSIDE (" + (prob*100).toFixed(1) + "%)";
-                statusBox.style.color = "#e74c3c"; // Red
-                if(userMarker) userMarker.setStyle({fillColor: '#e74c3c'});
+                zoneName = activeModel.labels[result.class] || "Priority " + result.class;
+                statusBox.innerText = zoneName + " (" + (result.prob*100).toFixed(1) + "%)";
+                statusBox.style.color = colors[result.class];
+                if(userMarker) userMarker.setStyle({fillColor: colors[result.class]});
+            }
+
+            // Stream payload back to Python Sandbox over WebSockets Cloud Relay
+            if (client.connected) {
+                let payload = {
+                    device_id: deviceId,
+                    lon: lon,
+                    lat: lat,
+                    zone: zoneName,
+                    prob: parseFloat(result.prob.toFixed(3))
+                };
+                client.publish(telemetryTopic, JSON.stringify(payload));
             }
         }
 
@@ -163,7 +219,6 @@
                 
                 document.getElementById('coords-box').innerText = "GPS: " + lon.toFixed(5) + ", " + lat.toFixed(5);
                 
-                // Update Marker on Map
                 if (!userMarker) {
                     userMarker = L.circleMarker([lat, lon], {
                         radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1
@@ -176,10 +231,10 @@
                 check_geofence(lon, lat);
                 
             }, (error) => {
-                document.getElementById('coords-box').innerText = "GPS Error: Please enable location permissions.";
+                document.getElementById('coords-box').innerText = "GPS Error: Check permissions.";
             }, { enableHighAccuracy: true });
         } else {
-            document.getElementById('coords-box').innerText = "Geolocation not supported by this browser.";
+            document.getElementById('coords-box').innerText = "Geolocation not supported.";
         }
     </script>
 </body>

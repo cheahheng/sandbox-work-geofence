@@ -5,39 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Neural Geofence Tracker</title>
     
-    <!-- Leaflet CSS & JS -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
     <style>
         body, html { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         #map { width: 100%; height: 100vh; z-index: 1; }
-        
-        /* Floating UI Overlay */
         #ui-layer {
             position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
             width: 90%; max-width: 400px; background: rgba(255, 255, 255, 0.95);
             padding: 20px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.2);
             z-index: 1000; text-align: center; backdrop-filter: blur(10px);
         }
-        
         #status-box { font-size: 28px; font-weight: 800; margin: 15px 0; color: #7f8c8d; transition: color 0.3s; }
         #coords-box { font-size: 12px; color: #95a5a6; margin-bottom: 15px; }
-        
         .btn {
-            display: block;             /* Forces the label to respect the width command */
-            box-sizing: border-box;     /* Keeps padding from stretching it past 100% */
+            display: block; box-sizing: border-box;
             background: #2980b9; color: white; border: none; padding: 12px 20px;
             border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%;
         }
-		
-        .ai-zone-label {
-            background: rgba(255, 255, 255, 0.8);
-            border: none;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-            font-weight: bold;
-            color: #2c3e50;
-        }
+        .ai-zone-label { background: rgba(255, 255, 255, 0.8); border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.4); font-weight: bold; color: #2c3e50; }
+        
+        /* --- NEW: Peer Device Label Styling --- */
+        .device-live-label { background: rgba(44, 62, 80, 0.9); border: 1px solid #34495e; color: #ffffff; font-weight: bold; border-radius: 4px; font-size: 11px; padding: 4px 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }
+        
         input[type="file"] { display: none; }
     </style>
 </head>
@@ -47,9 +38,7 @@
 
     <div id="ui-layer">
         <h3 style="margin-top:0; color: #2c3e50;">Neural Tracker</h3>
-        
         <button id="wakeBtn" class="btn" style="background: #e67e22; margin-bottom: 10px;">🌙 Keep Screen Awake</button>
-        
         <label for="modelInput" class="btn" id="uploadBtn">📂 Load geofence_model.json</label>
         <input type="file" id="modelInput" accept=".json" />
         
@@ -60,92 +49,137 @@
 
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <script>
-        // Prompt for Device ID immediately on launch
-        var deviceId = prompt("Please enter a unique Device ID / User Name:", "Device_" + Math.floor(Math.random() * 1000));
-        if (!deviceId || deviceId.trim() === "") {
-            deviceId = "Anonymous_Device";
-        }
-		
-        // --- 0. Wake Lock API (Prevents phone from sleeping) ---
+        var rawId = prompt("Please enter a unique Device ID / User Name:", "Device_" + Math.floor(Math.random() * 1000));
+        if (!rawId || rawId.trim() === "") rawId = "Anonymous_Device";
+        var deviceId = rawId.replace(/['"]/g, "").trim();
+
         let wakeLock = null;
         const wakeBtn = document.getElementById('wakeBtn');
-        
         wakeBtn.addEventListener('click', async () => {
             if ('wakeLock' in navigator) {
                 try {
                     if (!wakeLock) {
                         wakeLock = await navigator.wakeLock.request('screen');
                         wakeBtn.innerText = "☀️ Screen Awake (Active)";
-                        wakeBtn.style.background = "#2ecc71"; // Green
-                        
-                        // If the user minimizes the app, the OS releases the lock. We catch it here.
+                        wakeBtn.style.background = "#2ecc71"; 
                         wakeLock.addEventListener('release', () => {
                             wakeLock = null;
                             wakeBtn.innerText = "🌙 Keep Screen Awake";
-                            wakeBtn.style.background = "#e67e22"; // Orange
+                            wakeBtn.style.background = "#e67e22"; 
                         });
-                    } else {
-                        await wakeLock.release();
-                    }
-                } catch (err) {
-                    alert("Wake Lock error: " + err.message);
-                }
-            } else {
-                alert("Wake Lock is not supported on this browser.");
-            }
+                    } else { await wakeLock.release(); }
+                } catch (err) { alert("Wake Lock error: " + err.message); }
+            } else { alert("Wake Lock is not supported on this browser."); }
         });
 
-        // --- 1. Map & MQTT Initialization ---
         var map = L.map('map', {zoomControl: false}).setView([0, 0], 2);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
         
         var userMarker = null;
         var boundaryLayers = [];
         var activeModel = null;
+        
+        var lastLon = null;
+        var lastLat = null;
+        
+        // --- NEW: Peer Tracking Dictionary ---
+        var peerMarkers = {};
+        const STALE_THRESHOLD_MS = 15000; // 15 seconds
 
-        // Secure MQTT over WebSockets (Using HiveMQ secure public endpoint)
-        // Fully compliant with GitHub HTTPS hosting constraints
-        // Port 8884 is the standard SSL/TLS WebSockets port for HiveMQ
         const brokerUrl = 'wss://broker.hivemq.com:8884/mqtt'; 
         const telemetryTopic = 'neural_sandbox/telemetry/stream';
         const client = mqtt.connect(brokerUrl, { 
             clientId: 'client_' + deviceId + '_' + Math.random().toString(16).substr(2, 8),
-            clean: true,
-            connectTimeout: 4000
+            clean: true, connectTimeout: 4000
         });
 
         client.on('connect', () => {
-            console.log('Connected to Cloud IoT Relay Engine');
             document.getElementById('mqtt-box').innerText = "📡 Relay: Online as " + deviceId;
-            document.getElementById('mqtt-box').style.color = "#2ecc71"; // Green
+            document.getElementById('mqtt-box').style.color = "#2ecc71";
+            
+            // --- NEW: Subscribe to the telemetry stream to hear other devices! ---
+            client.subscribe(telemetryTopic);
+            
+            if (lastLon !== null && lastLat !== null) {
+                check_geofence(lastLon, lastLat);
+            }
         });
 
         client.on('error', (err) => {
-            console.error('MQTT Connection Error: ', err);
             document.getElementById('mqtt-box').innerText = "⚠️ Relay Error: Check Port/SSL";
-            document.getElementById('mqtt-box').style.color = "#e74c3c"; // Red
+            document.getElementById('mqtt-box').style.color = "#e74c3c"; 
         });
 
         client.on('offline', () => {
             document.getElementById('mqtt-box').innerText = "💤 Relay: Offline";
-            document.getElementById('mqtt-box').style.color = "#7f8c8d"; // Grey
+            document.getElementById('mqtt-box').style.color = "#7f8c8d"; 
         });
 
-        // --- 2. Load the JSON Model ---
+        // --- NEW: Process Incoming Peer Data ---
+        client.on('message', (topic, message) => {
+            if (topic === telemetryTopic) {
+                try {
+                    let payload = JSON.parse(message.toString());
+                    let peerId = payload.device_id;
+                    
+                    // Ignore our own broadcast loopback
+                    if (peerId === deviceId) return;
+
+                    let pLat = payload.lat;
+                    let pLon = payload.lon;
+                    let pZone = payload.zone;
+                    
+                    // Match desktop color logic
+                    let pColor = '#95a5a6';
+                    let zn = pZone.toLowerCase();
+                    if (zn.includes("inside") || zn.includes("zone") || zn.includes("priority")) {
+                        if (!zn.includes("outside") && !zn.includes("not assigned")) {
+                            pColor = '#2ecc71'; // Green inside
+                        }
+                    }
+
+                    if (peerMarkers[peerId]) {
+                        peerMarkers[peerId].marker.setLatLng([pLat, pLon]);
+                        peerMarkers[peerId].marker.setStyle({fillColor: pColor});
+                        peerMarkers[peerId].marker.setTooltipContent("<b>" + peerId + "</b><br>Status: " + pZone);
+                        peerMarkers[peerId].lastSeen = Date.now();
+                    } else {
+                        // Create a new marker for the newly discovered peer
+                        let m = L.circleMarker([pLat, pLon], {
+                            radius: 7, color: 'black', weight: 2, fillColor: pColor, fillOpacity: 0.9
+                        }).bindTooltip("<b>" + peerId + "</b><br>Status: " + pZone, { 
+                            permanent: true, direction: "top", opacity: 0.9, className: "device-live-label" 
+                        }).addTo(map);
+                        
+                        peerMarkers[peerId] = { marker: m, lastSeen: Date.now() };
+                    }
+                } catch(e) {
+                    // Quietly ignore malformed JSON packets
+                }
+            }
+        });
+
+        // --- NEW: Stale Peer Pruning Loop (Runs every 2 seconds) ---
+        setInterval(() => {
+            let now = Date.now();
+            for (let pid in peerMarkers) {
+                if (now - peerMarkers[pid].lastSeen > STALE_THRESHOLD_MS) {
+                    map.removeLayer(peerMarkers[pid].marker); // Wipe off map
+                    delete peerMarkers[pid]; // Remove from tracking memory
+                }
+            }
+        }, 2000);
+
         document.getElementById('modelInput').addEventListener('change', function(e) {
             var file = e.target.files[0];
             if (!file) return;
-            
             var reader = new FileReader();
             reader.onload = function(evt) {
                 try {
                     activeModel = JSON.parse(evt.target.result);
                     document.getElementById('uploadBtn').innerText = "✅ Model Loaded: " + activeModel.arch;
-                    document.getElementById('status-box').innerText = "SEARCHING GPS...";
                     
-                    if (window.boundaryLayers) {
-                        window.boundaryLayers.forEach(layer => map.removeLayer(layer));
-                    }
+                    if (window.boundaryLayers) { window.boundaryLayers.forEach(layer => map.removeLayer(layer)); }
                     window.boundaryLayers = [];
 
                     if (activeModel.boundary && activeModel.boundary.length > 0) {
@@ -154,35 +188,26 @@
                             let zoneName = activeModel.labels[group.class_idx] || "Priority " + group.class_idx;
                             let layer = L.polygon(group.polys, {
                                 color: group.color, weight: 3, fillColor: group.color, fillOpacity: 0.2, dashArray: '5, 5'
-                            }).bindTooltip(zoneName, {
-                                permanent: true, direction: "center", className: "ai-zone-label"
-                            }).addTo(map);
+                            }).bindTooltip(zoneName, { permanent: true, direction: "center", className: "ai-zone-label" }).addTo(map);
                             window.boundaryLayers.push(layer);
                             allBounds.push(layer.getBounds());
                         });
-                        if (allBounds.length > 0) {
-                            map.fitBounds(allBounds[0], {padding: [50, 50]});
-                        }
-                    } else {
-                        map.setView([activeModel.anchor_lat, activeModel.anchor_lon], 18);
-                    }
-                } catch(err) {
-                    alert("Invalid JSON Model file!");
-                }
+                        if (allBounds.length > 0) map.fitBounds(allBounds[0], {padding: [50, 50]});
+                    } else { map.setView([activeModel.anchor_lat, activeModel.anchor_lon], 18); }
+                    
+                    if (lastLon !== null && lastLat !== null) { check_geofence(lastLon, lastLat); }
+                    
+                } catch(err) { alert("Invalid JSON Model file!"); }
             };
             reader.readAsText(file);
         });
 
         function relu(x) { return Math.max(0, x); }
-        function sigmoid(x) { return 1.0 / (1.0 + Math.exp(-x)); }
-
         function dense_layer(input_vec, weight_matrix, bias_vec, apply_relu) {
             let out = new Array(bias_vec.length).fill(0);
             for(let i = 0; i < bias_vec.length; i++) {
                 let sum = bias_vec[i];
-                for(let j = 0; j < input_vec.length; j++) {
-                    sum += input_vec[j] * weight_matrix[i][j];
-                }
+                for(let j = 0; j < input_vec.length; j++) sum += input_vec[j] * weight_matrix[i][j];
                 out[i] = apply_relu ? relu(sum) : sum;
             }
             return out;
@@ -208,19 +233,13 @@
                 out = dense_layer(out, w["model.6.weight"], w["model.6.bias"], false);
             }
             
-            let max_val = Math.max(...out);
-            let sum_exp = 0.0;
+            let max_val = Math.max(...out); let sum_exp = 0.0;
             let exp_out = out.map(v => { let e = Math.exp(v - max_val); sum_exp += e; return e; });
-            
             let best_class = 0; let best_prob = 0;
-            for(let i=0; i<4; i++) {
-                let prob = exp_out[i] / sum_exp;
-                if(prob > best_prob) { best_prob = prob; best_class = i; }
-            }
+            for(let i=0; i<4; i++) { let prob = exp_out[i] / sum_exp; if(prob > best_prob) { best_prob = prob; best_class = i; } }
             return {class: best_class, prob: best_prob};
         }
 
-        // --- 4. Live GPS Processing ---
         const DEG2RAD = Math.PI / 180.0;
         const EARTH_DEG_METERS = 111320.0;
 
@@ -228,20 +247,15 @@
             let statusBox = document.getElementById('status-box');
             let zoneName = "Not Assigned";
             let prob = 0.0;
-            let color = '#95a5a6'; // Default Grey
+            let color = '#95a5a6';
 
-            // Only run the Neural Network if the JSON file is loaded!
             if (activeModel) {
                 let lat_rad = activeModel.anchor_lat * DEG2RAD;
                 let x_m = (lon - activeModel.anchor_lon) * EARTH_DEG_METERS * Math.cos(lat_rad);
                 let y_m = (lat - activeModel.anchor_lat) * EARTH_DEG_METERS;
                 
-                let norm_x = x_m / activeModel.scale_factor;
-                let norm_y = y_m / activeModel.scale_factor;
-                
-                let result = neural_inference(norm_x, norm_y);
+                let result = neural_inference(x_m / activeModel.scale_factor, y_m / activeModel.scale_factor);
                 prob = result.prob;
-                
                 let colors = {0: '#95a5a6', 1: '#2ecc71', 2: '#f1c40f', 3: '#e74c3c'};
                 
                 if (result.class === 0) {
@@ -260,47 +274,35 @@
                 statusBox.style.color = color;
             }
 
-            // Color the map marker
             if(userMarker) userMarker.setStyle({fillColor: color});
 
-            // ALWAYS Stream payload back to Python Sandbox, even if Not Assigned!
             if (client.connected) {
-                let payload = {
-                    device_id: deviceId,
-                    lon: lon,
-                    lat: lat,
-                    zone: zoneName,
-                    prob: parseFloat(prob.toFixed(3))
-                };
+                let payload = { device_id: deviceId, lon: lon, lat: lat, zone: zoneName, prob: parseFloat(prob.toFixed(3)) };
                 client.publish(telemetryTopic, JSON.stringify(payload));
             }
         }
 
-        // --- 5. GPS Hardware Hook ---
         if ("geolocation" in navigator) {
             navigator.geolocation.watchPosition((position) => {
                 let lat = position.coords.latitude;
                 let lon = position.coords.longitude;
                 
+                lastLat = lat;
+                lastLon = lon;
+                
                 document.getElementById('coords-box').innerText = "GPS: " + lon.toFixed(5) + ", " + lat.toFixed(5);
                 
                 if (!userMarker) {
-                    userMarker = L.circleMarker([lat, lon], {
-                        radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1
-                    }).addTo(map);
+                    userMarker = L.circleMarker([lat, lon], { radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1 }).addTo(map);
                     map.setView([lat, lon], 16);
-                } else {
-                    userMarker.setLatLng([lat, lon]);
-                }
+                } else { userMarker.setLatLng([lat, lon]); }
                 
                 check_geofence(lon, lat);
                 
             }, (error) => {
                 document.getElementById('coords-box').innerText = "GPS Error: Check permissions.";
             }, { enableHighAccuracy: true });
-        } else {
-            document.getElementById('coords-box').innerText = "Geolocation not supported.";
-        }
+        } else { document.getElementById('coords-box').innerText = "Geolocation not supported."; }
     </script>
 </body>
 </html>

@@ -274,7 +274,11 @@
                 statusBox.style.color = color;
             }
 
-            if(userMarker) userMarker.setStyle({fillColor: color});
+            // Update personal marker color AND tooltip text!
+            if(userMarker) {
+                userMarker.setStyle({fillColor: color});
+                userMarker.setTooltipContent("<b>" + deviceId + " (You)</b><br>Status: " + zoneName);
+            }
 
             if (client.connected) {
                 let payload = { device_id: deviceId, lon: lon, lat: lat, zone: zoneName, prob: parseFloat(prob.toFixed(3)) };
@@ -293,9 +297,14 @@
                 document.getElementById('coords-box').innerText = "GPS: " + lon.toFixed(5) + ", " + lat.toFixed(5);
                 
                 if (!userMarker) {
-                    userMarker = L.circleMarker([lat, lon], { radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1 }).addTo(map);
+                    userMarker = L.circleMarker([lat, lon], { radius: 8, color: 'white', weight: 3, fillColor: '#95a5a6', fillOpacity: 1 })
+                        .bindTooltip("<b>" + deviceId + " (You)</b><br>Status: Searching...", { 
+                            permanent: true, direction: "top", opacity: 0.9, className: "device-live-label" 
+                        }).addTo(map);
                     map.setView([lat, lon], 16);
-                } else { userMarker.setLatLng([lat, lon]); }
+                } else { 
+                    userMarker.setLatLng([lat, lon]); 
+                }
                 
                 check_geofence(lon, lat);
                 
